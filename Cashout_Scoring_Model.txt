@@ -1,0 +1,380 @@
+---- Find out pending cashouts, revenue, cost and margin of these cashouts
+  with base_data as (select 
+  id,
+  user,
+  createdAt,
+  status,
+  amount,
+  iban,
+  cost,
+  Revenue,
+  margin,
+  percent_margin,
+  prev_reason,
+  prev_createdAt
+   from
+   (select 
+   id,
+  h.user as user,
+  createdAt,
+  status,
+  amount,
+  iban,
+  cost,
+  Revenue,
+  margin,
+  percent_margin,
+  row_number() over (partition by h.user order by i.prev_created_time desc) as prev_time_rank,
+  i.prev_reason,
+  i.prev_created_time as prev_createdAt
+   from
+  (select 
+  id,
+  user,
+  createdAt,
+  status,
+  amount,
+  iban,
+  ((prev_total)/2000) as cost,
+  revenue.lifetimeRevenue as Revenue,
+  revenue.lifetimeRevenue - ((prev_total)/2000) as margin, 
+  ((revenue.lifetimeRevenue - ((prev_total)/2000))/revenue.lifetimeRevenue*100) as percent_margin
+from
+(
+  select 
+  id,
+  user,
+  createdAt, 
+  status,
+  iban,
+  amount, 
+  coalesce(sum(b.prev_amount),0) as prev_total
+    from ((
+      select id,
+      user, 
+      createdAt, 
+      status,
+      abs(amount) as amount, 
+      iban, 
+      left(iban,2) as iban_country
+  from `infra-prod-5b13acf6.public.Cashout` 
+  where status  = 'PENDING'
+  order by amount desc, user asc) a
+left join
+(
+  select distinct user as prev_user,
+  status as prev_status,
+  createdAt as prev_time,
+  abs(amount) as prev_amount ----avoid database recording issue prior to spring 2023 where amount is recorded as negative
+  from `infra-prod-5b13acf6.public.Cashout`
+  where status in ('ACCEPTED','DONE','PENDING')) b
+on a.user = b.prev_user)
+group by 1,2,3,4,5,6) a_cost
+left join
+(SELECT 
+  u.uuid as uuid, 
+  ROUND(SUM(IF(ct.type IN ('AD'), amount*0.0008,0) + IF(ct.type IN ('OFFERWALL', 'SURVEY'), amount*0.001, 0)),2) AS lifetimeRevenue
+FROM `infra-prod-5b13acf6.public.User` AS u
+LEFT JOIN `infra-prod-5b13acf6.public.CoinAccount` AS ca ON u.id = ca.userId
+LEFT JOIN `infra-prod-5b13acf6.public.CoinTransactions` AS ct ON ca.id = ct.coinAccountId
+GROUP BY 1) revenue
+on a_cost.user = revenue.uuid) h
+left join
+(select distinct user, createdAt as prev_created_time,reason as prev_reason,decision as prev_decision from
+`infra-prod-5b13acf6.Sydney_Fraud_Model.scoring_history`
+where decision = 'reject') i
+on h.user = i.user
+and h.createdAt > i.prev_created_time)
+where prev_time_rank = 1),
+
+
+--find out users who have published referral codes on app stores referencing referral_code_slack table
+
+referral_code_id as (
+  SELECT 
+  uuid 
+  FROM `infra-prod-5b13acf6.Sydney_Fraud_Model.referral_code_slack`  f
+inner join `infra-prod-5b13acf6.public.User` g
+on f.referral_code = g.referralCode
+where match_amount > 0),
+
+-- find out previously rejected users
+prev_rejected_id as (
+  select user as uuid 
+  from(
+    select user 
+    from `infra-prod-5b13acf6.Sydney_Fraud_Model.scoring_history`
+    where decision = 'reject')
+  ),
+
+
+-- user_ids who have referral fraud
+referral_fraud_id as (
+select uuid 
+from
+(select referal_rewards.userId 
+from
+(SELECT 
+b.userId,
+COUNT(*) as referral_parent_transaction_count
+FROM `infra-prod-5b13acf6.public.CoinTransactions` a
+LEFT JOIN `infra-prod-5b13acf6.public.CoinAccount` b 
+ON a.coinAccountId = b.id
+WHERE a.type = "REFERRAL-PARENT"
+GROUP BY b.userId) referal_rewards
+inner join
+(SELECT  -- number of activated referred users 
+  referrer as userId, 
+  COUNT(*) as activated_referred_count
+FROM `infra-prod-5b13acf6.public.ReferralUser`
+WHERE status = "COMPLETED" OR status = "CLAIMED"
+GROUP BY userId) active_referer
+on referal_rewards.userId = active_referer.userId
+where referal_rewards.referral_parent_transaction_count - active_referer.activated_referred_count > 3) a
+left join `infra-prod-5b13acf6.public.User` b
+on a.userId = b.id),
+
+---- FRAUD BUNDLE BLACKLISTED PER USERS 
+bundles_id as(
+select uuid from(
+SELECT 
+    mme.mp_user_id AS uuid, 
+    ARRAY_AGG(distinct bundles) AS bundles
+  FROM `infra-prod-5b13acf6.mp_step_submit_pipeline_duplicate.mp_master_event` AS mme
+  WHERE 
+     bundles LIKE "%com.simpleapps.fitas%"
+  OR bundles LIKE "%com.mls.step%"
+  OR bundles LIKE "%com.apple.shortcuts%"
+  OR bundles LIKE "%com.mls.poketwalk%"
+  OR bundles LIKE "%com.nauman.fakesync%"
+  OR bundles LIKE "%io.github.felixzheng98%"
+  OR bundles LIKE "%com.fitness.debugger%"
+  OR bundles LIKE "%pl.bubson.stepme%"
+  OR bundles LIKE "%com.binarygraft.pokewalk%"
+  OR bundles LIKE "%com.soystiken.debug_steps%"
+  OR bundles LIKE "%com.zjw.ffit%"
+  OR bundles LIKE "%fitapp.fittofit%"
+  OR bundles LIKE "%com.oplayer.forever%"
+  OR bundles LIKE "%com.fitbit.FitbitMobile%"
+  OR bundles LIKE "%cc.pacer.androidapp%"
+  OR bundles LIKE "%com.mapmywalk.android2%"
+  OR bundles LIKE "%com.binarygraft.pokewalk%"
+  OR bundles LIKE "%defit.adventuresync.pokewalker%"
+  OR bundles LIKE "%com.nauman.fakesyncpro%"
+  OR bundles LIKE "%io.github.felixzheng98.sitsync%"
+  OR bundles LIKE "%com.oplayer.silvercrest%"
+  OR bundles LIKE "%com.hypearth.flibble.app%"
+  OR bundles LIKE "%Corrado-Brusa%"
+  OR bundles LIKE "%com.seolfit.datatester%"
+  OR bundles LIKE "%defit.adventuresync.pokewalker%"
+  OR bundles LIKE "%com.Misaka.HiWatchPro%"
+  OR bundles LIKE "%com.oplayer.forever%"
+  OR bundles LIKE "%com.oplayer.foreversmart%"
+  OR bundles LIKE "%nl.appyhapps.healthsync%"
+GROUP BY 1)),
+
+--- high_velocity fraud
+high_velocity_id as (
+select uuid from
+  (SELECT 
+  mp_user_id as uuid, 
+  COUNT(*) as high_velocity_count
+  FROM `mp_step_submit_pipeline_duplicate.mp_master_event`
+  where maxvelocity > 230 
+  GROUP BY mp_user_id
+  HAVING high_velocity_count > 3
+  order by high_velocity_count asc)),
+
+--high_velocity_occurence fraud
+high_velocity_occurence_id as (select uuid from(
+  select mp_user_id as uuid from
+  (
+  SELECT 
+  mp_user_id, 
+  COUNT(*) as high_velocity_occurence_count
+  FROM `mp_step_submit_pipeline_duplicate.mp_master_event`
+  WHERE velocitymaxocc > 30 AND maxocc > 50
+  GROUP BY mp_user_id
+  HAVING high_velocity_occurence_count > 3 ))),
+
+-- here started are orange flags
+--- device already used:
+device_fraud_id as (
+  select mp_user_id as uuid 
+  from (
+    select mp_user_id, 
+    mp_device_id,
+    COUNT(distinct MP_USER_ID) over (partition by mp_DEVICE_id) as num_users
+FROM(
+select distinct mp_user_id, 
+lower(trim(mp_device_id)) as mp_device_id 
+from `infra-prod-5b13acf6.mp_step_submit_pipeline_duplicate.mp_master_event`)
+order by mp_device_id, MP_USER_ID asc)
+where num_users > 1),
+
+---user declared country not supported
+loc_not_supported_id as (
+  select mp_user_id as uuid
+from
+(SELECT 
+  mp_user_id, 
+  mp_country_code, 
+  ROW_NUMBER() OVER (PARTITION BY mp_user_id ORDER BY events_per_country DESC) AS row_nb
+FROM (
+SELECT 
+  mp_user_id,
+  mp_country_code,
+  COUNT(*) as events_per_country
+FROM `mp_step_submit_pipeline_duplicate.mp_master_event` 
+where mp_country_code is not null
+GROUP BY 
+  mp_user_id,
+  mp_country_code
+))
+WHERE row_nb = 1 and upper(trim(mp_country_code ))not in ('FR','LV','BE','IT','ES','CH','GR','GB','RO','MQ','DE','IE','RE','UA','PL','GF','NL','BG','YT','SE','GP','PT','LT','US','CA','AU','LU','NC')),
+
+---user walked more than 70k steps in one day
+
+more_than_70k_id as (
+  select uuid from(
+select us.uuid as uuid, 
+ds_us.count_higher_than_70k as count_70k
+from
+(SELECT 
+  ds.userId,
+  COUNTIF(ds.steps > 70000) AS count_higher_than_70k
+FROM `infra-prod-5b13acf6.public.DailySteps` AS ds
+GROUP BY userId) ds_us
+left join `infra-prod-5b13acf6.public.User`  us
+on ds_us.userId = us.id
+order by ds_us.count_higher_than_70k desc)
+where count_70k > 0),
+
+--iban already used
+
+used_iban_id as (
+select uuid 
+from (
+select distinct user as uuid from
+(select iban, 
+user,
+count(distinct user) over(partition by iban) as count_user
+from(select distinct user, 
+upper(trim(iban)) as iban
+from `infra-prod-5b13acf6.public.Cashout`
+where iban <> ''))
+where count_user > 1)),
+
+prev_part_rejected_id as(
+  select user as uuid 
+  from(
+    select user 
+    from `infra-prod-5b13acf6.Sydney_Fraud_Model.scoring_history`
+    where decision = 'partially_reject')
+  )
+
+
+select * , CURRENT_TIMESTAMP() as score_time,
+case when (margin < 0 and (
+  r_referral_code = 1 
+or r_prev_rejected = 1 
+or r_referral_fraud = 1 
+or r_bundles_fraud = 1 
+or r_high_velocity_fraud = 1 
+or r_high_velocity_occurence_fraud = 1))
+then "partially_reject"
+when (margin >= 0 and (
+  r_referral_code = 1
+or r_prev_rejected = 1 
+or r_referral_fraud = 1 
+or r_bundles_fraud = 1 
+or r_high_velocity_fraud = 1 
+or r_high_velocity_occurence_fraud = 1))
+then "partially_reject"
+when (
+  (o_iban_country_fraud = 1 
+  or o_device_fraud = 1 
+  or o_loc_not_supported = 1 
+  or o_more_than_70k = 1
+  or o_prev_part_rej = 1)) 
+  then "manual_review"
+when (
+  (o_iban_country_fraud = 0 
+  and o_device_fraud = 0 
+  and o_loc_not_supported = 0 
+  and o_more_than_70k = 0
+  and o_prev_part_rej = 0) 
+  and o_used_iban_id= 1 ) 
+  then "iban_already_used"
+else "approve" end as decision,
+case when (margin < 0 and (
+  r_referral_code = 1
+or r_prev_rejected = 1 
+or r_referral_fraud = 1 
+or r_bundles_fraud = 1 
+or r_high_velocity_fraud = 1 
+or r_high_velocity_occurence_fraud = 1))
+then cast((0.5*abs(amount)) as string)
+when (margin >= 0 and (
+  r_referral_code = 1
+or r_prev_rejected = 1 
+or r_referral_fraud = 1 
+or r_bundles_fraud = 1 
+or r_high_velocity_fraud = 1 
+or r_high_velocity_occurence_fraud = 1))
+then cast((0.5*abs(amount)) as string)
+when (
+  (o_iban_country_fraud = 1 
+  or o_device_fraud = 1 
+  or o_loc_not_supported = 1 
+  or o_more_than_70k = 1
+  or o_prev_part_rej = 1)) 
+  then "Awaiting manual review"
+when (
+  (o_iban_country_fraud = 0 
+  and o_device_fraud = 0 
+  and o_loc_not_supported = 0 
+  and o_more_than_70k = 0
+  and o_prev_part_rej = 0) 
+  and o_used_iban_id= 1 ) 
+  then cast(amount as string)
+else cast(0 as string) end as give_back_amount ,
+  case when r_referral_code = 1 then "code-store"
+  when r_prev_rejected = 1 then coalesce(prev_reason,"previously rejected pending evaluation")
+  when r_referral_fraud = 1 then "fake-referral"
+  when r_bundles_fraud = 1 then "fraud-app"
+  when r_high_velocity_fraud = 1 then "fraud-app"
+  when r_high_velocity_occurence_fraud = 1 then "fraud-app"
+  when o_iban_country_fraud = 1 then "loc-not-supported"
+  when o_device_fraud = 1 then "fake-referral"
+  when o_loc_not_supported = 1 then "loc-not-supported"
+  when o_more_than_70k = 1 then "fraud-app"
+  when o_used_iban_id = 1 then "iban-already-used"
+  when o_prev_part_rej = 1 then "previously rejected pending evaluation"
+  else ""
+  end as reason
+  from(
+  select *, left(iban,2) as iban_country,
+  case when user in (select uuid from referral_code_id) then 1 else 0 end as r_referral_code,
+  case when user in (select uuid from prev_rejected_id) then 1 else 0 end as r_prev_rejected,
+  case when user in (select uuid from referral_fraud_id) then 1 else 0 end as r_referral_fraud,
+  case when user in (select uuid from bundles_id) then 1 else 0 end as r_bundles_fraud,
+  case when user in (select uuid from high_velocity_id) then 1 else 0 end as r_high_velocity_fraud,
+  case when user in (select uuid from high_velocity_occurence_id) then 1 else 0 end as r_high_velocity_occurence_fraud,
+  case when upper(left(iban,2)) not in ('FR','LV','BE','IT','ES','CH','GR','GB','RO','MQ','DE','IE','RE','UA','PL','GF','NL','BG','YT','SE','GP','PT','LT','US','CA','AU','LU','NC') then 1 else 0  end as o_iban_country_fraud,
+  case when user in (select uuid from device_fraud_id) then 1 else 0 end as o_device_fraud,
+  case when user in (select uuid from loc_not_supported_id) then 1 else 0 end as o_loc_not_supported,
+  case when user in (select uuid from more_than_70k_id) then 1 else 0 end as o_more_than_70k,
+  case when user in (select uuid from used_iban_id) then 1 else 0 end as o_used_iban_id,
+  case when user in (select uuid from prev_part_rejected_id) then 1 else 0 end as o_prev_part_rej
+  
+  from base_data
+  order by user desc);
+  ---where r_high_velocity_fraud = 1 or r_high_velocity_occurence_fraud = 1 or r_referral_fraud = 1 or r_bundles_fraud = 1 or o_device_fraud = 1 or r_iban_country_fraud = 1 or o_loc_not_supported = 1 or o_more_than_70k = 1 or o_used_iban_id = 1
+
+
+
+
+---INSERT INTO `infra-prod-5b13acf6.Sydney_Fraud_Model.Scoring History` (user,createdAt,status,amount,iban,cost,Revenue,margin,percent_margin,iban_country,r_prev_rejected,r_referral_fraud,r_bundles_fraud,r_high_velocity_fraud,r_high_velocity_occurence_fraud,o_iban_country_fraud,o_device_fraud,o_loc_not_supported,o_more_than_70k,o_used_iban_id,decision,give_back_amount,reason,r_referral_code,cashout_id,score_time)
+---SELECT user,createdAt,status,amount,iban,cost,Revenue,margin,percent_margin,iban_country,r_prev_rejected,r_referral_fraud,r_bundles_fraud,r_high_velocity_fraud,r_high_velocity_occurence_fraud,o_iban_country_fraud,o_device_fraud,o_loc_not_supported,o_more_than_70k,o_used_iban_id,decision,give_back_amount,reason,r_referral_code,id,CURRENT_TIMESTAMP() as score_time
+---FROM `infra-prod-5b13acf6.Sydney_Fraud_Model.Flags_detection`
